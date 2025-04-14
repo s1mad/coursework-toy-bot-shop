@@ -1,0 +1,8 @@
+nltk==3.9.1
+scikit-learn==1.6.1
+python-telegram-bot==22.0
+SpeechRecognition==3.10.2
+gTTS==2.5.4
+pydub==0.25.1
+python-dotenv==1.1.0
+rapidfuzz==3.12.2

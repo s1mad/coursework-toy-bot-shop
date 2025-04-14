@@ -1,0 +1,17 @@
+services:
+  telegram_bot:
+    build: .
+    container_name: telegram_bot
+    env_file: .env
+    volumes:
+      - ./models:/app/models
+    command: python3 app/bot.py
+    depends_on:
+      - train_intent_model
+
+  train_intent_model:
+    build: .
+    container_name: train_intent_model
+    volumes:
+      - ./models:/app/models
+    command: python3 app/train_intent_model.py
