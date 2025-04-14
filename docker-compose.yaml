@@ -7,7 +7,10 @@ services:
       - ./models:/app/models
     command: python3 app/bot.py
     depends_on:
-      - train_intent_model
+      train_intent_model:
+        condition: service_completed_successfully
+      train_dialogues_model:
+        condition: service_completed_successfully
 
   train_intent_model:
     build: .
@@ -15,3 +18,10 @@ services:
     volumes:
       - ./models:/app/models
     command: python3 app/train_intent_model.py
+
+  train_dialogues_model:
+    build: .
+    container_name: train_dialogues_model
+    volumes:
+      - ./models:/app/models
+    command: python3 app/train_dialogues_model.py

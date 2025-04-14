@@ -5,7 +5,6 @@ import nltk
 import pickle
 import os
 import logging
-from rapidfuzz import process, fuzz
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 import speech_recognition as sr
@@ -13,32 +12,35 @@ from gtts import gTTS
 from pydub import AudioSegment
 from dotenv import load_dotenv
 from data.config import CONFIG
-
-# Логирование
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+from utils import clear_phrase, is_meaningful_text, extract_age, extract_toy_name, extract_toy_category, extract_price, is_age_in_range, Stats, logger
 
 # Загрузка токена
 load_dotenv()
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 
-# Загрузка модели
+# Загрузка модели для намерений
 try:
     with open('models/intent_model.pkl', 'rb') as f:
         clf = pickle.load(f)
     with open('models/intent_vectorizer.pkl', 'rb') as f:
         vectorizer = pickle.load(f)
 except FileNotFoundError as e:
-    logger.error(f"Не найдены файлы модели: {e}")
+    logger.error(f"Не найдены файлы модели для намерений: {e}")
     raise
 
-# Очистка фразы
-def clear_phrase(phrase):
-    if not phrase:
-        return ""
-    phrase = phrase.lower()
-    alphabet = 'абвгдеёжзийклмнопрстуфхцчшщъыьэюя- '
-    return ''.join(symbol for symbol in phrase if symbol in alphabet).strip()
+# Загрузка модели для dialogues.txt
+try:
+    with open('models/dialogues_vectorizer.pkl', 'rb') as f:
+        tfidf_vectorizer = pickle.load(f)
+    with open('models/dialogues_matrix.pkl', 'rb') as f:
+        tfidf_matrix = pickle.load(f)
+    with open('models/dialogues_answers.pkl', 'rb') as f:
+        answers = pickle.load(f)
+except FileNotFoundError as e:
+    logger.error(f"Не найдены файлы модели для dialogues.txt: {e}")
+    raise
 
 # Классификация намерения
 def classify_intent(replica):
@@ -62,46 +64,6 @@ def classify_intent(replica):
     logger.info(f"Classify intent: replica='{replica}', predicted='{intent}', best_intent='{best_intent}', score={best_score}")
     return best_intent or intent if best_score >= 0.65 else None
 
-# Извлечение игрушки
-def extract_toy_name(replica):
-    replica = clear_phrase(replica)
-    if not replica:
-        return None
-    for toy, data in CONFIG['toys'].items():
-        if toy.lower() in replica or any(syn.lower() in replica for syn in data.get('synonyms', [])):
-            return toy
-        candidates = [toy] + data.get('synonyms', [])
-        best_match = process.extractOne(replica, candidates, scorer=fuzz.partial_ratio)
-        if best_match and best_match[1] > 85:
-            return toy
-    return None
-
-# Извлечение возраста
-def extract_age(replica):
-    replica = clear_phrase(replica)
-    if not replica:
-        return None
-    words = replica.split()
-    for i, word in enumerate(words):
-        if word.isdigit():
-            return word
-        elif word in ['год', 'года', 'лет']:
-            if i > 0 and words[i - 1].isdigit():
-                return words[i - 1]
-    return None
-
-# Извлечение категории
-def extract_toy_category(replica):
-    replica = clear_phrase(replica)
-    if not replica:
-        return None
-    for category in CONFIG['categories']:
-        category_variants = [category, category + 'ы', category[:-1] + 'ая', category[:-1] + 'и']
-        for variant in category_variants:
-            if variant.lower() in replica:
-                return category
-    return None
-
 # Получение ответа
 def get_answer_by_intent(intent, replica, context):
     toy_name = context.user_data.get('current_toy')
@@ -109,6 +71,7 @@ def get_answer_by_intent(intent, replica, context):
     last_intent = context.user_data.get('last_intent', '')
     toy_category = extract_toy_category(replica)
     age = extract_age(replica)
+    price = extract_price(replica)
 
     if intent in CONFIG['intents']:
         responses = CONFIG['intents'][intent]['responses']
@@ -156,7 +119,7 @@ def get_answer_by_intent(intent, replica, context):
 
         elif intent == 'toy_recommendation':
             if age:
-                suitable_toys = [toy for toy, data in CONFIG['toys'].items() if age in data['age']]
+                suitable_toys = [toy for toy, data in CONFIG['toys'].items() if is_age_in_range(age, data['age'])]
                 if suitable_toys:
                     toy_name = random.choice(suitable_toys)
                     context.user_data['current_toy'] = toy_name
@@ -199,11 +162,36 @@ def get_answer_by_intent(intent, replica, context):
                 answer = "Хорошо, что интересует? Игрушки, цены или что-то ещё?"
 
         elif intent == 'no':
-            if last_intent in ['toy_price', 'toy_info', 'toy_availability', 'order_toy']:
-                context.user_data['current_toy'] = None
-                answer = "Хорошо, давай выберем другую игрушку. Что интересно?"
+            context.user_data['current_toy'] = None
+            context.user_data['state'] = 'NONE'
+            answer = "Хорошо, какую игрушку обсудим теперь?"
+
+        elif intent == 'filter_toys':
+            if price and age:
+                suitable_toys = [toy for toy, data in CONFIG['toys'].items() if data['price'] <= price and is_age_in_range(age, data['age'])]
+                if suitable_toys:
+                    toys_list = ', '.join(suitable_toys)
+                    answer = f"Для возраста {age} лет и до {price} рублей есть: {toys_list}."
+                else:
+                    answer = f"Извините, нет игрушек для возраста {age} лет и до {price} рублей."
+            elif price:
+                suitable_toys = [toy for toy, data in CONFIG['toys'].items() if data['price'] <= price]
+                if suitable_toys:
+                    toys_list = ', '.join(suitable_toys)
+                    answer = f"До {price} рублей есть: {toys_list}."
+                else:
+                    answer = f"Извините, нет игрушек до {price} рублей."
+            elif age:
+                suitable_toys = [toy for toy, data in CONFIG['toys'].items() if is_age_in_range(age, data['age'])]
+                if suitable_toys:
+                    toys_list = ', '.join(suitable_toys)
+                    answer = f"Для возраста {age} лет есть: {toys_list}."
+                    context.user_data['current_toy'] = random.choice(suitable_toys)
+                    context.user_data['state'] = 'WAITING_FOR_INTENT'
+                else:
+                    answer = f"Извините, нет игрушек для возраста {age} лет."
             else:
-                answer = "Понял, чем могу помочь?"
+                answer = "Укажите возраст или цену для фильтрации."
 
         # Реклама
         if intent in ['hello', 'toy_types'] and random.random() < 0.2:
@@ -214,36 +202,24 @@ def get_answer_by_intent(intent, replica, context):
         return answer
     return None
 
-# Ответ из dialogues.txt
+# Ответ из dialogues.txt с TF-IDF
 def generate_answer(replica, context):
     replica = clear_phrase(replica)
-    if not replica or not os.path.exists('data/dialogues.txt'):
+    if not replica or not answers:
         return None
-    try:
-        with open('data/dialogues.txt', encoding='utf-8') as f:
-            content = f.read()
-    except Exception as e:
-        logger.error(f"Ошибка чтения dialogues.txt: {e}")
+    if not is_meaningful_text(replica):
         return None
-    dialogues = [d.split('\n')[:2] for d in content.split('\n\n') if len(d.split('\n')) >= 2]
-    answers = []
-    for question, answer in dialogues:
-        question = clear_phrase(question[1:].strip() if question.startswith('-') else question)
-        if not question:
-            continue
-        answer = answer[1:].strip() if answer.startswith('-') else answer
-        similarity = fuzz.partial_ratio(replica, question)
-        if similarity > 80:  # Порог для примерного сходства
-            answers.append([similarity, answer])
-    if answers:
-        best_answer = max(answers, key=lambda x: x[0])[1]
-        logger.info(f"Found in dialogues.txt: replica='{replica}', answer='{best_answer}'")
-        # Реклама
+    replica_vector = tfidf_vectorizer.transform([replica])
+    similarities = cosine_similarity(replica_vector, tfidf_matrix).flatten()
+    best_idx = similarities.argmax()
+    if similarities[best_idx] > 0.5:
+        answer = answers[best_idx]
+        logger.info(f"Found in dialogues.txt: replica='{replica}', answer='{answer}', similarity={similarities[best_idx]}")
         if random.random() < 0.3:
             ad_toy = random.choice(list(CONFIG['toys'].keys()))
-            best_answer += f" Кстати, у нас есть {ad_toy} — отличный выбор для детей {CONFIG['toys'][ad_toy]['age']}!"
+            answer += f" Кстати, у нас есть {ad_toy} — отличный выбор для детей {CONFIG['toys'][ad_toy]['age']}!"
         context.user_data['last_intent'] = 'offtopic'
-        return best_answer
+        return answer
     logger.info(f"No match in dialogues.txt for replica='{replica}'")
     return None
 
@@ -254,6 +230,7 @@ def get_failure_phrase():
 
 # Основная логика
 def bot(replica, context):
+    stats = Stats(context)
     if 'state' not in context.user_data:
         context.user_data['state'] = 'NONE'
     if 'current_toy' not in context.user_data:
@@ -264,18 +241,34 @@ def bot(replica, context):
         context.user_data['last_intent'] = None
     if 'history' not in context.user_data:
         context.user_data['history'] = []
-    if 'stats' not in context.user_data:
-        context.user_data['stats'] = {'intent': 0, 'generate': 0, 'failure': 0}
 
     context.user_data['history'].append(replica)
     context.user_data['history'] = context.user_data['history'][-5:]
 
     state = context.user_data['state']
-    stats = context.user_data['stats']
-
     logger.info(f"Processing: replica='{replica}', state='{state}', last_intent='{context.user_data.get('last_intent')}'")
 
-    # Состояния
+    # Проверка на несуразный текст
+    if not is_meaningful_text(replica):
+        context.user_data['state'] = 'NONE'
+        context.user_data['current_toy'] = None
+        answer = get_failure_phrase()
+        context.user_data['last_bot_response'] = answer
+        stats.add('failure', replica, answer, context)
+        return answer
+
+    # Проверка возраста и цены
+    age = extract_age(replica)
+    price = extract_price(replica)
+    if age or price:
+        intent = 'filter_toys'
+        answer = get_answer_by_intent(intent, replica, context)
+        if answer:
+            context.user_data['last_bot_response'] = answer
+            stats.add('intent', replica, answer, context)
+            return answer
+
+    # Обработка состояния
     if state == 'WAITING_FOR_TOY':
         toy_name = extract_toy_name(replica)
         if toy_name:
@@ -283,9 +276,7 @@ def bot(replica, context):
             context.user_data['state'] = 'WAITING_FOR_INTENT'
             answer = f"Вы имеете в виду {toy_name}? Хотите узнать цену, описание или наличие?"
             context.user_data['last_bot_response'] = answer
-            stats['intent'] += 1
-            context.user_data['stats'] = stats
-            logger.info(f"Stats: {stats} | Вопрос: {replica} | Ответ: {answer}")
+            stats.add('intent', replica, answer, context)
             return answer
         toy_category = extract_toy_category(replica)
         if toy_category:
@@ -296,42 +287,31 @@ def bot(replica, context):
                 context.user_data['state'] = 'WAITING_FOR_INTENT'
                 answer = f"Из {toy_category} есть {toy_name}. Хотите узнать цену, описание или наличие?"
                 context.user_data['last_bot_response'] = answer
-                stats['intent'] += 1
-                context.user_data['stats'] = stats
-                logger.info(f"Stats: {stats} | Вопрос: {replica} | Ответ: {answer}")
+                stats.add('intent', replica, answer, context)
                 return answer
-        stats['failure'] += 1
-        context.user_data['stats'] = stats
         answer = "Пожалуйста, уточните название игрушки или категорию."
         context.user_data['last_bot_response'] = answer
-        logger.info(f"Stats: {stats} | Вопрос: {replica} | Ответ: {answer}")
+        stats.add('failure', replica, answer, context)
         return answer
 
     if state == 'WAITING_FOR_AGE':
-        age = extract_age(replica)
         if age:
             context.user_data['state'] = 'NONE'
-            suitable_toys = [toy for toy, data in CONFIG['toys'].items() if age in data['age']]
+            suitable_toys = [toy for toy, data in CONFIG['toys'].items() if is_age_in_range(age, data['age'])]
             if suitable_toys:
                 toy_name = random.choice(suitable_toys)
                 context.user_data['current_toy'] = toy_name
                 answer = f"Для возраста {age} лет советую {toy_name}! Хотите узнать цену или описание?"
                 context.user_data['last_bot_response'] = answer
-                stats['intent'] += 1
-                context.user_data['stats'] = stats
-                logger.info(f"Stats: {stats} | Вопрос: {replica} | Ответ: {answer}")
+                stats.add('intent', replica, answer, context)
                 return answer
             answer = f"Извините, нет игрушек для возраста {age} лет. Попробуйте другой возраст."
             context.user_data['last_bot_response'] = answer
-            stats['failure'] += 1
-            context.user_data['stats'] = stats
-            logger.info(f"Stats: {stats} | Вопрос: {replica} | Ответ: {answer}")
+            stats.add('failure', replica, answer, context)
             return answer
-        stats['failure'] += 1
-        context.user_data['stats'] = stats
         answer = "Укажите возраст, например, '5 лет'."
         context.user_data['last_bot_response'] = answer
-        logger.info(f"Stats: {stats} | Вопрос: {replica} | Ответ: {answer}")
+        stats.add('failure', replica, answer, context)
         return answer
 
     if state == 'WAITING_FOR_INTENT':
@@ -341,9 +321,7 @@ def bot(replica, context):
             answer = get_answer_by_intent(intent, replica, context)
             if answer:
                 context.user_data['last_bot_response'] = answer
-                stats['intent'] += 1
-                context.user_data['stats'] = stats
-                logger.info(f"Stats: {stats} | Вопрос: {replica} | Ответ: {answer}")
+                stats.add('intent', replica, answer, context)
                 return answer
         if intent == 'yes':
             toy_name = context.user_data.get('current_toy')
@@ -351,25 +329,19 @@ def bot(replica, context):
                 context.user_data['state'] = 'NONE'
                 answer = f"Цена на {toy_name} — {CONFIG['toys'][toy_name]['price']} рублей. Что ещё интересует?"
                 context.user_data['last_bot_response'] = answer
-                stats['intent'] += 1
-                context.user_data['stats'] = stats
-                logger.info(f"Stats: {stats} | Вопрос: {replica} | Ответ: {answer}")
+                stats.add('intent', replica, answer, context)
                 return answer
         if intent == 'no':
             context.user_data['current_toy'] = None
             context.user_data['state'] = 'NONE'
             answer = "Хорошо, какую игрушку обсудим теперь?"
             context.user_data['last_bot_response'] = answer
-            stats['intent'] += 1
-            context.user_data['stats'] = stats
-            logger.info(f"Stats: {stats} | Вопрос: {replica} | Ответ: {answer}")
+            stats.add('intent', replica, answer, context)
             return answer
-        stats['failure'] += 1
-        context.user_data['stats'] = stats
         toy_name = context.user_data.get('current_toy', 'игрушку')
         answer = f"Что хотите узнать про {toy_name}: цену, описание или наличие?"
         context.user_data['last_bot_response'] = answer
-        logger.info(f"Stats: {stats} | Вопрос: {replica} | Ответ: {answer}")
+        stats.add('failure', replica, answer, context)
         return answer
 
     # Проверка игрушки
@@ -379,9 +351,7 @@ def bot(replica, context):
         context.user_data['state'] = 'WAITING_FOR_INTENT'
         answer = f"Вы имеете в виду {toy_name}? Хотите узнать цену, описание или наличие?"
         context.user_data['last_bot_response'] = answer
-        stats['intent'] += 1
-        context.user_data['stats'] = stats
-        logger.info(f"Stats: {stats} | Вопрос: {replica} | Ответ: {answer}")
+        stats.add('intent', replica, answer, context)
         return answer
 
     # Проверка категории
@@ -394,15 +364,11 @@ def bot(replica, context):
             context.user_data['state'] = 'WAITING_FOR_INTENT'
             answer = f"Из {toy_category} есть {toy_name}. Хотите узнать цену, описание или наличие?"
             context.user_data['last_bot_response'] = answer
-            stats['intent'] += 1
-            context.user_data['stats'] = stats
-            logger.info(f"Stats: {stats} | Вопрос: {replica} | Ответ: {answer}")
+            stats.add('intent', replica, answer, context)
             return answer
         answer = f"У нас нет игрушек в категории {toy_category}. Попробуйте другую категорию!"
         context.user_data['last_bot_response'] = answer
-        stats['failure'] += 1
-        context.user_data['stats'] = stats
-        logger.info(f"Stats: {stats} | Вопрос: {replica} | Ответ: {answer}")
+        stats.add('failure', replica, answer, context)
         return answer
 
     # Классификация намерения
@@ -411,26 +377,20 @@ def bot(replica, context):
         answer = get_answer_by_intent(intent, replica, context)
         if answer:
             context.user_data['last_bot_response'] = answer
-            stats['intent'] += 1
-            context.user_data['stats'] = stats
-            logger.info(f"Stats: {stats} | Вопрос: {replica} | Ответ: {answer}")
+            stats.add('intent', replica, answer, context)
             return answer
 
     # dialogues.txt для отвлечённых тем
     answer = generate_answer(replica, context)
     if answer:
         context.user_data['last_bot_response'] = answer
-        stats['generate'] += 1
-        context.user_data['stats'] = stats
-        logger.info(f"Stats: {stats} | Вопрос: {replica} | Ответ: {answer}")
+        stats.add('generate', replica, answer, context)
         return answer
 
     # Заглушка как последний вариант
-    stats['failure'] += 1
-    context.user_data['stats'] = stats
     answer = get_failure_phrase()
     context.user_data['last_bot_response'] = answer
-    logger.info(f"Stats: {stats} | Вопрос: {replica} | Ответ: {answer}")
+    stats.add('failure', replica, answer, context)
     return answer
 
 # Голос в текст
@@ -521,7 +481,7 @@ def run_bot():
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
-    logger.info("Бот запущен")
+    logger.info("Бот запускается...")
     app.run_polling()
 
 if __name__ == '__main__':

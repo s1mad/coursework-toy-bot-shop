@@ -5,13 +5,16 @@ import os
 from sklearn.svm import LinearSVC
 from sklearn.feature_extraction.text import TfidfVectorizer
 from data.config import CONFIG
+from utils import clear_phrase, logger
+
+logger.info("Начинается обучение модели для intents")
 
 # Подготовка данных
 X_text = []
 y = []
 for intent, data in CONFIG['intents'].items():
     for example in data['examples']:
-        X_text.append(example)
+        X_text.append(clear_phrase(example))
         y.append(intent)
 
 # Векторайзер
@@ -31,4 +34,4 @@ with open('models/intent_model.pkl', 'wb') as f:
 with open('models/intent_vectorizer.pkl', 'wb') as f:
     pickle.dump(vectorizer, f)
 
-print("Модель обучена и сохранена в ./models/")
+logger.info("Модель для intents обучена и сохранена в ./models/")
