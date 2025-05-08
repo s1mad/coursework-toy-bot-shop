@@ -5,7 +5,7 @@ import os
 from sklearn.svm import LinearSVC
 from sklearn.feature_extraction.text import TfidfVectorizer
 from data.config import CONFIG
-from utils import clear_phrase, logger
+from utils import clear_phrase, lemmatize_phrase, logger
 
 logger.info("Начинается обучение модели для intents")
 
@@ -14,7 +14,8 @@ X_text = []
 y = []
 for intent, data in CONFIG['intents'].items():
     for example in data['examples']:
-        X_text.append(clear_phrase(example))
+        lemmatized_example = lemmatize_phrase(clear_phrase(example))
+        X_text.append(lemmatized_example)
         y.append(intent)
 
 # Векторайзер

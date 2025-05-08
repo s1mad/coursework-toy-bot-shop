@@ -361,7 +361,7 @@ CONFIG = {
     ],
     'thresholds': {
         'dialogues_similarity': 0.5,
-        'intent_score': 0.65,
+        'intent_score': 0.6,
         'fuzzy_match_toy': 85,
     },
     'history_limit': 5,
